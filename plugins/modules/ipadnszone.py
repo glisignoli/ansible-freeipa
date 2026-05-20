@@ -231,7 +231,9 @@ from ansible.module_utils.ansible_freeipa_module import (
     compare_args_ipa,
     IPAParamMapping,
     DNSName,
-    netaddr
+    netaddr,
+    IPADiffTracker,
+    gen_args_diff,
 )  # noqa: E402
 from ansible.module_utils import six
 
@@ -276,6 +278,7 @@ class DNSZoneModule(IPAAnsibleModule):
         self.commands = []
         self.ipa_params = IPAParamMapping(self, ipa_param_mapping)
         self.exit_args = {}
+        self.diff_tracker = IPADiffTracker()
 
     def validate_ips(self, ips, error_msg):
         invalid_ips = [
@@ -493,6 +496,7 @@ class DNSZoneModule(IPAAnsibleModule):
                     # Since the zone doesn't exist we just create it
                     #   with given args
                     self.commands.append((zone_name, "dnszone_add", args))
+                    self.diff_tracker.add_entry_diff(zone_name, {}, args)
                     is_zone_active = True
                     # just_added = True
 
@@ -501,6 +505,9 @@ class DNSZoneModule(IPAAnsibleModule):
                     #   matches the current config. If not we updated it.
                     if not compare_args_ipa(self, args, zone):
                         self.commands.append((zone_name, "dnszone_mod", args))
+                        before, after = gen_args_diff(args, zone)
+                        self.diff_tracker.add_entry_diff(
+                            zone_name, before, after)
 
                 # Permissions must be set on existing zones.
                 if self.ipa_params.permission is not None:
@@ -508,18 +515,38 @@ class DNSZoneModule(IPAAnsibleModule):
                     if self.ipa_params.permission and not is_managed:
                         self.commands.append(
                             (zone_name, "dnszone_add_permission", {}))
+                        self.diff_tracker.add_entry_diff(
+                            zone_name,
+                            {"permission": False},
+                            {"permission": True})
                     if not self.ipa_params.permission and is_managed:
                         self.commands.append(
                             (zone_name, "dnszone_remove_permission", {}))
+                        self.diff_tracker.add_entry_diff(
+                            zone_name,
+                            {"permission": True},
+                            {"permission": False})
 
             if self.ipa_params.state == "enabled" and not is_zone_active:
                 self.commands.append((zone_name, "dnszone_enable", {}))
+                self.diff_tracker.add_entry_diff(
+                    zone_name,
+                    {"state": "disabled"},
+                    {"state": "enabled"})
 
             if self.ipa_params.state == "disabled" and is_zone_active:
                 self.commands.append((zone_name, "dnszone_disable", {}))
+                self.diff_tracker.add_entry_diff(
+                    zone_name,
+                    {"state": "enabled"},
+                    {"state": "disabled"})
 
             if self.ipa_params.state == "absent" and zone is not None:
                 self.commands.append((zone_name, "dnszone_del", {}))
+                self.diff_tracker.add_entry_diff(
+                    zone_name,
+                    {"state": "present"},
+                    {"state": "absent"})
 
     def process_results(self, _result, command, name, _args, exit_args):
         if command == "dnszone_add" and self.ipa_params.name_from_ip:
@@ -605,7 +632,8 @@ def main():
             result_handler=DNSZoneModule.process_results,
             exit_args=exit_args
         )
-    ansible_module.exit_json(changed=changed, **exit_args)
+    _exit_kwargs = dict(exit_args, **ansible_module.diff_tracker.build_diff())
+    ansible_module.exit_json(changed=changed, **_exit_kwargs)
 
 
 if __name__ == "__main__":

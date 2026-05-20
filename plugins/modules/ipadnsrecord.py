@@ -966,7 +966,8 @@ RETURN = """
 
 from ansible.module_utils._text import to_text
 from ansible.module_utils.ansible_freeipa_module import \
-    IPAAnsibleModule, is_ipv4_addr, is_ipv6_addr, ipalib_errors
+    IPAAnsibleModule, is_ipv4_addr, is_ipv6_addr, ipalib_errors, \
+    IPADiffTracker, gen_args_diff
 try:
     import dns.reversename
     import dns.resolver
@@ -1586,6 +1587,7 @@ def main():
 
     changed = False
     exit_args = {}
+    diff_tracker = IPADiffTracker()
 
     # Connect to IPA API
     with ansible_module.ipa_connect():
@@ -1608,13 +1610,45 @@ def main():
             res_find = find_dnsrecord(ansible_module, zone_name, name)
 
             cmds = []
+            diff_key = "%s/%s" % (zone_name, name)
 
             if state == 'present':
                 cmds = define_commands_for_present_state(
                     ansible_module, zone_name, entry, res_find)
+                if cmds:
+                    args = gen_args(entry)
+                    if res_find is None:
+                        diff_tracker.add_entry_diff(diff_key, {}, args)
+                    else:
+                        before, after = gen_args_diff(
+                            args, res_find, ignore=['idnsname'])
+                        diff_tracker.add_entry_diff(diff_key, before, after)
             elif state == 'absent':
                 cmds = define_commands_for_absent_state(
                     ansible_module, zone_name, entry, res_find)
+                if cmds:
+                    args = gen_args(entry)
+                    if args.get('del_all', False):
+                        diff_tracker.add_entry_diff(
+                            diff_key,
+                            {"state": "present"}, {"state": "absent"})
+                    else:
+                        records_to_delete = {
+                            k: v for k, v in args.items()
+                            if k.endswith('record')
+                        }
+                        actually_removed = {}
+                        if res_find:
+                            for rec, values in records_to_delete.items():
+                                del_list = [
+                                    v for v in values
+                                    if rec in res_find and v in res_find[rec]
+                                ]
+                                if del_list:
+                                    actually_removed[rec] = del_list
+                        if actually_removed:
+                            diff_tracker.add_entry_diff(
+                                diff_key, actually_removed, {})
             else:
                 ansible_module.fail_json(msg="Unkown state '%s'" % state)
 
@@ -1626,7 +1660,8 @@ def main():
             commands, exception_handler=exception_handler)
 
     # Done
-    ansible_module.exit_json(changed=changed, host=exit_args)
+    _exit_kwargs = dict(host=exit_args, **diff_tracker.build_diff())
+    ansible_module.exit_json(changed=changed, **_exit_kwargs)
 
 
 if __name__ == "__main__":

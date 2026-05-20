@@ -217,7 +217,8 @@ RETURN = """
 """
 
 from ansible.module_utils.ansible_freeipa_module import (
-    IPAAnsibleModule, compare_args_ipa, gen_add_del_lists, ipalib_errors, DN
+    IPAAnsibleModule, compare_args_ipa, gen_add_del_lists, ipalib_errors, DN,
+    IPADiffTracker, gen_args_diff
 )
 
 
@@ -444,9 +445,9 @@ def main():
     changed = False
     exit_args = {}
     res_find = None
+    diff_tracker = IPADiffTracker()
 
     with ansible_module.ipa_connect():
-
         commands = []
 
         for name in names:
@@ -459,7 +460,6 @@ def main():
 
             # Check inclusive and exclusive conditions
             if inclusive is not None or exclusive is not None:
-                # automember_type is either "group" or "hostgorup"
                 if automember_type == "group":
                     _type = u"user"
                 elif automember_type == "hostgroup":
@@ -490,20 +490,23 @@ def main():
                                                 res_find,
                                                 ignore=['type']):
                             commands.append([name, 'automember_mod', args])
+                            before, after = gen_args_diff(args, res_find, ignore=['type'])
+                            diff_tracker.add_entry_diff(name, before, after)
                     else:
                         commands.append([name, 'automember_add', args])
+                        diff_tracker.add_entry_diff(name, {}, args)
                         res_find = {}
 
                     if inclusive is not None:
                         inclusive_add, inclusive_del = gen_add_del_lists(
                             transform_conditions(inclusive),
-                            res_find.get("automemberinclusiveregex", [])
+                            (res_find or {}).get("automemberinclusiveregex", [])
                         )
 
                     if exclusive is not None:
                         exclusive_add, exclusive_del = gen_add_del_lists(
                             transform_conditions(exclusive),
-                            res_find.get("automemberexclusiveregex", [])
+                            (res_find or {}).get("automemberexclusiveregex", [])
                         )
 
                 elif action == "member":
@@ -520,6 +523,14 @@ def main():
                         automember_type, key, inclusiveregex=regex)
                     commands.append([name, 'automember_add_condition',
                                      condition_args])
+                    # For diff: show the regex being added
+                    before_list = (res_find or {}).get("automemberinclusiveregex", [])
+                    after_list = before_list + [f"{key}={regex}"]
+                    diff_tracker.add_entry_diff(
+                        name,
+                        {"inclusive": before_list},
+                        {"inclusive": after_list}
+                    )
 
                 for _inclusive in inclusive_del:
                     key, regex = _inclusive.split("=", 1)
@@ -527,6 +538,14 @@ def main():
                         automember_type, key, inclusiveregex=regex)
                     commands.append([name, 'automember_remove_condition',
                                      condition_args])
+                    # For diff: show the regex being removed
+                    before_list = (res_find or {}).get("automemberinclusiveregex", [])
+                    after_list = [r for r in before_list if r != f"{key}={regex}"]
+                    diff_tracker.add_entry_diff(
+                        name,
+                        {"inclusive": before_list},
+                        {"inclusive": after_list}
+                    )
 
                 for _exclusive in exclusive_add:
                     key, regex = _exclusive.split("=", 1)
@@ -534,6 +553,13 @@ def main():
                         automember_type, key, exclusiveregex=regex)
                     commands.append([name, 'automember_add_condition',
                                      condition_args])
+                    before_list = (res_find or {}).get("automemberexclusiveregex", [])
+                    after_list = before_list + [f"{key}={regex}"]
+                    diff_tracker.add_entry_diff(
+                        name,
+                        {"exclusive": before_list},
+                        {"exclusive": after_list}
+                    )
 
                 for _exclusive in exclusive_del:
                     key, regex = _exclusive.split("=", 1)
@@ -541,12 +567,24 @@ def main():
                         automember_type, key, exclusiveregex=regex)
                     commands.append([name, 'automember_remove_condition',
                                      condition_args])
+                    before_list = (res_find or {}).get("automemberexclusiveregex", [])
+                    after_list = [r for r in before_list if r != f"{key}={regex}"]
+                    diff_tracker.add_entry_diff(
+                        name,
+                        {"exclusive": before_list},
+                        {"exclusive": after_list}
+                    )
 
             elif state == 'absent':
                 if action == "automember":
                     if res_find is not None:
                         commands.append([name, 'automember_del',
                                          {'type': automember_type}])
+                        diff_tracker.add_entry_diff(
+                            name,
+                            {"state": "present"},
+                            {"state": "absent"}
+                        )
 
                 elif action == "member":
                     if res_find is None:
@@ -561,6 +599,13 @@ def main():
                             commands.append(
                                 [name, 'automember_remove_condition',
                                  condition_args])
+                            before_list = (res_find or {}).get("automemberinclusiveregex", [])
+                            after_list = [r for r in before_list if r != f"{key}={regex}"]
+                            diff_tracker.add_entry_diff(
+                                name,
+                                {"inclusive": before_list},
+                                {"inclusive": after_list}
+                            )
 
                     if exclusive is not None:
                         for _exclusive in transform_conditions(exclusive):
@@ -570,6 +615,13 @@ def main():
                             commands.append([name,
                                              'automember_remove_condition',
                                             condition_args])
+                            before_list = (res_find or {}).get("automemberexclusiveregex", [])
+                            after_list = [r for r in before_list if r != f"{key}={regex}"]
+                            diff_tracker.add_entry_diff(
+                                name,
+                                {"exclusive": before_list},
+                                {"exclusive": after_list}
+                            )
 
         if len(names) == 0:
             if state == "rebuilt":
@@ -580,7 +632,7 @@ def main():
             elif state == "orphans_removed":
                 res_find = find_automember_orphans(ansible_module,
                                                    automember_type)
-                if res_find["count"] > 0:
+                if (res_find or {}).get("count", 0) > 0:
                     commands.append([None, 'automember_find_orphans',
                                      {'type': automember_type,
                                       'remove': True}])
@@ -590,28 +642,37 @@ def main():
                                                          automember_type)
 
                 if default_group == "":
-                    if isinstance(res_find["automemberdefaultgroup"], list):
+                    if isinstance((res_find or {}).get("automemberdefaultgroup", None), list):
                         commands.append([None,
                                          'automember_default_group_remove',
                                          {'type': automember_type}])
+                        diff_tracker.add_entry_diff(
+                            None,
+                            {"default_group": (res_find or {}).get("automemberdefaultgroup", [])},
+                            {"default_group": []}
+                        )
 
                 else:
                     dn_default_group = [DN(('cn', default_group),
                                            ('cn', '%ss' % automember_type),
                                            ('cn', 'accounts'),
                                            ansible_module.ipa_get_basedn())]
-                    if repr(res_find["automemberdefaultgroup"]) != \
+                    if repr((res_find or {}).get("automemberdefaultgroup", None)) != \
                        repr(dn_default_group):
                         commands.append(
                             [None, 'automember_default_group_set',
                              {'type': automember_type,
                               'automemberdefaultgroup': default_group}])
+                        diff_tracker.add_entry_diff(
+                            None,
+                            {"default_group": (res_find or {}).get("automemberdefaultgroup", None)},
+                            {"default_group": dn_default_group}
+                        )
 
             else:
                 ansible_module.fail_json(msg="Invalid operation")
 
         # Execute commands
-
         changed = ansible_module.execute_ipa_commands(commands)
 
         # result["failed"] is used only for INCLUDE_RE, EXCLUDE_RE
@@ -622,7 +683,8 @@ def main():
         # in other modules.
 
     # Done
-    ansible_module.exit_json(changed=changed, **exit_args)
+    _exit_kwargs = dict(exit_args, **diff_tracker.build_diff())
+    ansible_module.exit_json(changed=changed, **_exit_kwargs)
 
 
 if __name__ == "__main__":

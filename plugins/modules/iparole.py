@@ -134,7 +134,7 @@ EXAMPLES = """
 from ansible.module_utils._text import to_text
 from ansible.module_utils.ansible_freeipa_module import \
     IPAAnsibleModule, gen_add_del_lists, compare_args_ipa, \
-    gen_intersection_list, ensure_fqdn, ipalib_errors
+    gen_intersection_list, ensure_fqdn, ipalib_errors, IPADiffTracker, gen_args_diff
 from ansible.module_utils import six
 
 if six.PY3:
@@ -468,9 +468,9 @@ def main():
 
     # Init
 
+    diff_tracker = IPADiffTracker()
     # Connect to IPA API
     with ansible_module.ipa_connect():
-
         state = ansible_module.params_get("state")
         action = ansible_module.params_get("action")
         names = ansible_module.params_get("name")
@@ -484,18 +484,61 @@ def main():
                 msg="sysaccount members are not supported by your IPA version")
 
         for name in names:
+            res_find = find_role(ansible_module, name)
+            args = gen_args(ansible_module)
+            # Diff for role add
+            if state == "present" and action == "role":
+                if res_find is None:
+                    diff_tracker.add_entry_diff(name, {}, args)
+                elif not compare_args_ipa(ansible_module, args, res_find):
+                    before, after = gen_args_diff(args, res_find)
+                    diff_tracker.add_entry_diff(name, before, after)
+            # Diff for role rename
+            if state == "renamed":
+                if res_find is not None:
+                    before, after = gen_args_diff(args, res_find)
+                    diff_tracker.add_entry_diff(name, before, after)
+            # Diff for role delete
+            if state == "absent" and action == "role" and res_find is not None:
+                diff_tracker.add_entry_diff(name, res_find, {})
+            # Diff for member add/remove
+            # Only for present/absent and action=member
+            if action == "member" and res_find is not None:
+                # privilege
+                param = ansible_module.params_get_lowercase("privilege")
+                if param is not None:
+                    before = set(result_get_value_lowercase(res_find, "memberof_privilege", []))
+                    after = set(param)
+                    if before != after:
+                        diff_tracker.add_entry_diff(f"{name}/privilege", list(before), list(after))
+                # user, group, host, hostgroup, sysaccount
+                for key in ["user", "group", "host", "hostgroup", "sysaccount"]:
+                    param = ansible_module.params_get_lowercase(key)
+                    if param is not None:
+                        before = set(result_get_value_lowercase(res_find, f"member_{key}", []))
+                        after = set(param)
+                        if before != after:
+                            diff_tracker.add_entry_diff(f"{name}/{key}", list(before), list(after))
+                # service
+                param = get_service_param(ansible_module, "service")
+                if param is not None:
+                    before = set(result_get_value_lowercase(res_find, "member_service", []))
+                    after = set(param.keys())
+                    if before != after:
+                        diff_tracker.add_entry_diff(f"{name}/service", list(before), list(after))
+
             cmds = role_commands_for_name(ansible_module, state, action, name)
             commands.extend(cmds)
 
         exit_args = {}
 
         # Execute commands
-
         changed = ansible_module.execute_ipa_commands(
             commands, fail_on_member_errors=True)
 
     # Done
-    ansible_module.exit_json(changed=changed, **exit_args)
+    _exit_kwargs = dict(exit_args, **diff_tracker.build_diff())
+    ansible_module.exit_json(changed=changed, **_exit_kwargs)
 
 
 if __name__ == "__main__":

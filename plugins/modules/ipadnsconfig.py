@@ -120,7 +120,7 @@ RETURN = """
 """
 
 from ansible.module_utils.ansible_freeipa_module import \
-    IPAAnsibleModule, compare_args_ipa, is_ipv4_addr, is_ipv6_addr
+    IPAAnsibleModule, compare_args_ipa, is_ipv4_addr, is_ipv6_addr, IPADiffTracker, gen_args_diff
 
 
 def find_dnsconfig(module):
@@ -242,30 +242,31 @@ def main():
 
     # Init
 
+
     changed = False
+    diff_tracker = IPADiffTracker()
 
     # Connect to IPA API
     with ansible_module.ipa_connect():
-
         res_find = find_dnsconfig(ansible_module)
         args = gen_args(ansible_module, state, action, res_find, forwarders,
                         forward_policy, allow_sync_ptr)
 
         # Execute command only if configuration changes.
         if not compare_args_ipa(ansible_module, args, res_find):
+            before, after = gen_args_diff(args, res_find)
+            diff_tracker.add_entry_diff("dnsconfig", before, after)
             try:
                 if not ansible_module.check_mode:
                     ansible_module.ipa_command_no_name('dnsconfig_mod', args)
-                # If command did not fail, something changed.
                 changed = True
-
             except Exception as e:
                 msg = str(e)
                 ansible_module.fail_json(msg="dnsconfig_mod: %s" % msg)
 
     # Done
-
-    ansible_module.exit_json(changed=changed)
+    _exit_kwargs = dict(diff_tracker.build_diff())
+    ansible_module.exit_json(changed=changed, **_exit_kwargs)
 
 
 if __name__ == "__main__":
